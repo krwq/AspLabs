@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
+using System.Collections;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -92,10 +93,28 @@ namespace Microsoft.AspNetCore.Grpc.HttpApi.Internal.Json
             }
             else
             {
-                MessageConverter<Any>.WriteMessageFields(writer, valueMessage, _settings, options);
+                WriteMessageFields(writer, valueMessage, _settings, options);
             }
 
             writer.WriteEndObject();
+        }
+
+        private static void WriteMessageFields(Utf8JsonWriter writer, IMessage message, JsonSettings settings, JsonSerializerOptions options)
+        {
+            var fields = message.Descriptor.Fields;
+
+            foreach (var field in fields.InFieldNumberOrder())
+            {
+                var accessor = field.Accessor;
+                var value = accessor.GetValue(message);
+                if (!JsonTypeResolver.ShouldFormatFieldValue(message, field, value, settings.FormatDefaultValues))
+                {
+                    continue;
+                }
+
+                writer.WritePropertyName(accessor.Descriptor.JsonName);
+                JsonSerializer.Serialize(writer, value, value.GetType(), options);
+            }
         }
     }
 }
