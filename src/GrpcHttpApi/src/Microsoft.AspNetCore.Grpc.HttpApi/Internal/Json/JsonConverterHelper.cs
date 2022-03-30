@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Google.Protobuf;
 using Google.Protobuf.Reflection;
 using Google.Protobuf.WellKnownTypes;
@@ -53,7 +54,8 @@ namespace Microsoft.AspNetCore.Grpc.HttpApi.Internal.Json
             options.Converters.Add(new JsonConverterFactoryForEnum(settings));
             options.Converters.Add(new JsonConverterFactoryForWrappers(settings));
             options.Converters.Add(new JsonConverterFactoryForWellKnownTypes(settings));
-            options.Converters.Add(new JsonConverterFactoryForMessage(settings));
+
+            options.TypeInfoResolver = new JsonTypeResolver(settings, options);
 
             return options;
         }
