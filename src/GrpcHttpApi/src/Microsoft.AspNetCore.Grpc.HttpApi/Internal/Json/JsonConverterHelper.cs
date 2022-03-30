@@ -55,8 +55,7 @@ namespace Microsoft.AspNetCore.Grpc.HttpApi.Internal.Json
             options.Converters.Add(new JsonConverterFactoryForWrappers(settings));
             options.Converters.Add(new JsonConverterFactoryForWellKnownTypes(settings));
 
-            JsonTypeResolver typeResolver = new(settings);
-            options.TypeInfoResolver.OnObjectContractInitializing = typeResolver.OnContractIntializing;
+            options.TypeInfoResolver = new JsonTypeResolver(settings, options);
 
             return options;
         }

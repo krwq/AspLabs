@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,26 +13,26 @@ using Google.Protobuf.Reflection;
 
 namespace Microsoft.AspNetCore.Grpc.HttpApi.Internal.Json
 {
-    internal class JsonTypeResolver
+    internal class JsonTypeResolver : DefaultJsonTypeInfoResolver
     {
         private JsonSettings _settings;
 
-        public JsonTypeResolver(JsonSettings settings)
+        public JsonTypeResolver(JsonSettings settings, JsonSerializerOptions options) : base(options)
         {
             _settings = settings;
         }
 
-        internal void OnContractIntializing(JsonTypeInfo typeInfo)
+        public override JsonTypeInfo GetTypeInfo(Type type)
         {
-            if (!typeof(IMessage).IsAssignableFrom(typeInfo.Type))
-                return;
+            if (!typeof(IMessage).IsAssignableFrom(type))
+                return base.GetTypeInfo(type);
 
-            Console.WriteLine($"Initializing type: {typeInfo.Type.FullName}");
+            var typeInfo = JsonTypeInfo.CreateJsonTypeInfo(type, Options);
             var messageProto = (IMessage)Activator.CreateInstance(typeInfo.Type)!;
 
             var grpcFields = messageProto.Descriptor.Fields.InFieldNumberOrder();
 
-            List<JsonPropertyInfo> jsonProperties = new();
+            BindingFlags bindingFlags = BindingFlags.NonPublic | BindingFlags.Instance;
 
             foreach (var field in grpcFields)
             {
@@ -41,58 +42,91 @@ namespace Microsoft.AspNetCore.Grpc.HttpApi.Internal.Json
                 if (field.IsMap)
                 {
                     var mapFields = field.MessageType.Fields.InFieldNumberOrder();
-                    var mapKey = mapFields[0];
-                    var mapValue = mapFields[1];
+                    var keyType = JsonConverterHelper.GetFieldType(mapFields[0]);
+                    var valueType = JsonConverterHelper.GetFieldType(mapFields[1]);
 
-                    var keyType = JsonConverterHelper.GetFieldType(mapKey);
-                    var valueType = JsonConverterHelper.GetFieldType(mapValue);
-
-                    var repeatedFieldType = typeof(Dictionary<,>).MakeGenericType(keyType, valueType);
-
-                    prop = typeInfo.CreateJsonProperty(typeof(IDictionary), field.JsonName);
-                    prop.Get = (o) => field.Accessor.GetValue((IMessage)o);
-                    prop.ReadObject = (object parentObj, ref Utf8JsonReader reader) =>
-                    {
-                        var newValues = (IDictionary)JsonSerializer.Deserialize(ref reader, repeatedFieldType, prop.Options)!;
-
-                        var existingValue = (IDictionary)field.Accessor.GetValue((IMessage)parentObj);
-                        foreach (DictionaryEntry item in newValues)
-                        {
-                            existingValue[item.Key] = item.Value;
-                        }
-                    };
+                    prop = (JsonPropertyInfo)typeof(JsonTypeResolver).GetMethod(nameof(CreateMapProperty), bindingFlags)!
+                        .MakeGenericMethod(keyType, valueType)
+                        .Invoke(this, new object[] { typeInfo, field })!;
                 }
                 else if (field.IsRepeated)
                 {
-                    prop = typeInfo.CreateJsonProperty(typeof(IList<>).MakeGenericType(fieldType), field.JsonName);
-                    prop.Get = (o) => field.Accessor.GetValue((IMessage)o);
-                    prop.ReadObject = (object parentObj, ref Utf8JsonReader reader) =>
-                    {
-                        JsonConverterHelper.PopulateList(ref reader, prop.Options, (IMessage)parentObj, field);
-                    };
+                    prop = (JsonPropertyInfo)typeof(JsonTypeResolver).GetMethod(nameof(CreateRepeatedProperty), bindingFlags)!
+                        .MakeGenericMethod(fieldType)
+                        .Invoke(this, new object[] { typeInfo, field })!;
                 }
                 else
                 {
-                    prop = typeInfo.CreateJsonProperty(fieldType, field.JsonName);
-                    prop.Get = (o) => field.Accessor.GetValue((IMessage)o);
-                    prop.Set = (o, val) =>
-                    {
-                        var message = (IMessage)o;
-                        ValidateOneOf(field, message);
-                        field.Accessor.SetValue(message, val);
-                    };
+                    prop = (JsonPropertyInfo)typeof(JsonTypeResolver).GetMethod(nameof(CreateProperty), bindingFlags)!
+                        .MakeGenericMethod(fieldType)
+                        .Invoke(this, new object[] { typeInfo, field })!;
                 }
 
-                prop.CanSerialize = (parentObj, value) =>
-                {
-                    IMessage message = (IMessage)parentObj;
-                    return ShouldFormatFieldValue(message, field, value, _settings.FormatDefaultValues);
-                };
-
-                jsonProperties.Add(prop);
+                typeInfo.Properties.Add(prop);
             }
 
-            typeInfo.Properties = jsonProperties;
+            return typeInfo;
+        }
+
+        private JsonPropertyInfo<IDictionary<TKey, TValue>> CreateMapProperty<TKey, TValue>(JsonTypeInfo typeInfo, FieldDescriptor field)
+        {
+            JsonPropertyInfo<IDictionary<TKey, TValue>> prop = typeInfo.CreateJsonProperty<IDictionary<TKey, TValue>>(field.JsonName);
+            prop.Get = (o) => (IDictionary<TKey, TValue>)field.Accessor.GetValue((IMessage)o);
+            prop.Set = (o, val) =>
+            {
+                IDictionary<TKey, TValue> source = val!;
+                IDictionary<TKey, TValue> destination = (IDictionary<TKey, TValue>)field.Accessor.GetValue((IMessage)o);
+                foreach (var el in source)
+                {
+                    destination.Add(el.Key, el.Value);
+                }
+            };
+            prop.CanSerialize = CanSerializeMethod<IDictionary<TKey, TValue>>(field);
+
+            return prop;
+        }
+
+        private JsonPropertyInfo<IList<T>> CreateRepeatedProperty<T>(JsonTypeInfo typeInfo, FieldDescriptor field)
+        {
+            JsonPropertyInfo<IList<T>> prop = typeInfo.CreateJsonProperty<IList<T>>(field.JsonName);
+            prop.Get = (o) => (IList<T>)field.Accessor.GetValue((IMessage)o);
+            prop.Set = (o, val) =>
+            {
+                IList<T> source = val!;
+                IList<T> destination = (IList<T>)field.Accessor.GetValue((IMessage)o);
+                foreach (var el in source)
+                {
+                    destination.Add(el);
+                }
+            };
+
+            prop.CanSerialize = CanSerializeMethod<IList<T>>(field);
+
+            return prop;
+        }
+
+        private JsonPropertyInfo<T> CreateProperty<T>(JsonTypeInfo typeInfo, FieldDescriptor field)
+        {
+            JsonPropertyInfo<T> prop = typeInfo.CreateJsonProperty<T>(field.JsonName);
+            prop.Get = (o) => (T)field.Accessor.GetValue((IMessage)o);
+            prop.Set = (o, val) =>
+            {
+                var message = (IMessage)o;
+                ValidateOneOf(field, message);
+                field.Accessor.SetValue(message, val);
+            };
+
+            prop.CanSerialize = CanSerializeMethod<T>(field);
+            return prop;
+        }
+
+        private Func<object, T?, bool> CanSerializeMethod<T>(FieldDescriptor field)
+        {
+            return (object parentObj, T? value) =>
+            {
+                IMessage message = (IMessage)parentObj;
+                return ShouldFormatFieldValue(message, field, value, _settings.FormatDefaultValues);
+            };
         }
 
         /// <summary>
